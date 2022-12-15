@@ -2,103 +2,169 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
+	"runtime"
+	"sync"
 	"time"
 )
 
-// ЗАДАНИЕ:
-// * сделать из плохого кода хороший;
-// * важно сохранить логику появления ошибочных тасков;
-// * сделать правильную мультипоточность обработки заданий.
-// Обновленный код отправить через merge-request.
-
-// приложение эмулирует получение и обработку тасков, пытается и получать и обрабатывать в многопоточном режиме
-// В конце должно выводить успешные таски и ошибки выполнены остальных тасков
-
-// A Ttype represents a meaninglessness of our life
-type Ttype struct {
-	id         int
-	cT         string // время создания
-	fT         string // время выполнения
-	taskRESULT []byte
+// For thread-safe get ID for tasks
+type SafeCounter struct {
+	mu sync.Mutex
+	id int
 }
 
+func (c *SafeCounter) GetID() int {
+	result_id := 0
+	c.mu.Lock()
+	c.id++
+	result_id = c.id
+	c.mu.Unlock()
+	return result_id
+}
+
+// Ttype represents a task with its id, creation time, execution time, and status.
+type Ttype struct {
+	id         int
+	cT         time.Time // Creation Time
+	fT         time.Time // Execution Time
+	taskStatus int
+}
+
+const (
+	STATUS_ERROR_TASK       = iota
+	STATUS_READY_TO_PROCESS = iota
+	STATUS_DONE             = iota
+	STATUS_UNDONE           = iota
+)
+
 func main() {
-	taskCreturer := func(a chan Ttype) {
-		go func() {
-			for {
-				ft := time.Now().Format(time.RFC3339)
-				if time.Now().Nanosecond()%2 > 0 { // вот такое условие появления ошибочных тасков
-					ft = "Some error occured"
-				}
-				a <- Ttype{cT: ft, id: int(time.Now().Unix())} // передаем таск на выполнение
+	// Init safe counter for task ids
+	safeCounter := SafeCounter{}
+
+	// Set the total execution time to 3 seconds.
+	end_time := time.Now().Add(3 * time.Second)
+
+	// Create a channel to receive tasks.
+	taskChan := make(chan Ttype, 10)
+	// Channels for collecting results
+	doneTasks := make(chan Ttype, 10)
+	undoneTasks := make(chan error, 10)
+
+	// Final result of the execution
+	results := make(map[int]Ttype)
+	errors := []error{}
+
+	// Use a wait group to wait for all goroutines to finish.
+	var wg sync.WaitGroup
+	var worker_wg sync.WaitGroup
+
+	task_creturer := func() {
+		defer wg.Done()
+
+		// Create tasks for the total execution time.
+		for time.Now().Before(end_time) {
+			status := STATUS_READY_TO_PROCESS // ready to process
+
+			// Simulation of creating a task with an error
+			if rand.Intn(10) == 0 { // 1/10
+				status = STATUS_ERROR_TASK // Status indicating that an error has occurred
 			}
-		}()
-	}
 
-	superChan := make(chan Ttype, 10)
+			// Create a new task.
+			task := Ttype{
+				id:         safeCounter.GetID(),
+				cT:         time.Now(),
+				fT:         time.Now(),
+				taskStatus: status,
+			}
 
-	go taskCreturer(superChan)
-
-	task_worker := func(a Ttype) Ttype {
-		tt, _ := time.Parse(time.RFC3339, a.cT)
-		if tt.After(time.Now().Add(-20 * time.Second)) {
-			a.taskRESULT = []byte("task has been successed")
-		} else {
-			a.taskRESULT = []byte("something went wrong")
+			// Send the task to the channel.
+			taskChan <- task
 		}
-		a.fT = time.Now().Format(time.RFC3339Nano)
 
-		time.Sleep(time.Millisecond * 150)
-
-		return a
+		// Close the channel when all tasks have been sent.
+		close(taskChan)
 	}
 
-	doneTasks := make(chan Ttype)
-	undoneTasks := make(chan error)
-
-	tasksorter := func(t Ttype) {
-		if string(t.taskRESULT[14:]) == "successed" {
+	task_sorter := func(t Ttype) {
+		switch t.taskStatus {
+		case STATUS_DONE:
 			doneTasks <- t
-		} else {
-			undoneTasks <- fmt.Errorf("Task id %d time %s, error %s", t.id, t.cT, t.taskRESULT)
+			break
+		case STATUS_UNDONE:
+			undoneTasks <- fmt.Errorf("Task id %d time %s, error %s", t.id, t.cT, "Task completion failed")
+			break
+		case STATUS_ERROR_TASK:
+			undoneTasks <- fmt.Errorf("Task id %d time %s, error %s", t.id, t.cT, "The task was with an error")
+			break
+		default:
+			break
 		}
 	}
 
-	go func() {
-		// получение тасков
-		for t := range superChan {
-			t = task_worker(t)
-			go tasksorter(t)
-		}
-		close(superChan)
-	}()
+	task_worker := func() {
+		defer worker_wg.Done()
 
-	result := map[int]Ttype{}
-	err := []error{}
+		// Receive tasks from the channel until it is closed.
+		for task := range taskChan {
+			task.fT = time.Now()
+
+			if task.taskStatus == STATUS_READY_TO_PROCESS { // task ready to process
+				if rand.Float64() > 0.1 {
+					task.taskStatus = STATUS_DONE // Success
+				} else {
+					task.taskStatus = STATUS_UNDONE // Something went wrong.
+				}
+			}
+
+			task_sorter(task)
+		}
+
+	}
+
+	// Run main logic
+
+	// Start a goroutine to create tasks and send them to the channel.
+	wg.Add(1)
+	go task_creturer()
+
+	// Start a goroutine to receive tasks from the channel and process them.
 	go func() {
-		for r := range doneTasks {
-			go func() {
-				result[r.id] = r
-			}()
+		for i := 0; i < runtime.NumCPU(); i++ {
+			worker_wg.Add(1)
+			go task_worker()
 		}
-		for r := range undoneTasks {
-			go func() {
-				err = append(err, r)
-			}()
-		}
+		worker_wg.Wait()
+		// Сlose channels as soon as the workers complete their work.
 		close(doneTasks)
 		close(undoneTasks)
 	}()
 
-	time.Sleep(time.Second * 3)
+	// Collect data from channels and write them to result
+	{
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for task := range doneTasks {
+				results[task.id] = task
+			}
+		}()
+		go func() {
+			defer wg.Done()
 
-	println("Errors:")
-	for r := range err {
-		println(r)
+			for task_err := range undoneTasks {
+				errors = append(errors, task_err)
+			}
+		}()
 	}
 
-	println("Done tasks:")
-	for r := range result {
-		println(r)
-	}
+	// Wait for all goroutines to finish.
+	wg.Wait()
+
+	// Print successful tasks and errors
+	fmt.Println("Successful tasks:")
+	println(len(results), "tasks")
+	fmt.Println("Errors:")
+	println(len(errors), "tasks")
 }
